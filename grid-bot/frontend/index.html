@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>Grid Trading Bot</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Grid Trading Bot <span id="version-tag"></span></h1>
+    <p class="subtitle">Простой сеточный бот для криптобирж. Старт в demo-режиме.</p>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>1. Подключение биржи</h2>
+      <form id="key-form">
+        <div class="row">
+          <label>Биржа
+            <select name="exchange" id="exchange-select" required></select>
+          </label>
+          <label>Метка
+            <input name="label" type="text" value="default" />
+          </label>
+          <label class="checkbox">
+            <input name="testnet" type="checkbox" checked />
+            Demo / Testnet
+          </label>
+        </div>
+        <div class="row">
+          <label>API Key
+            <input name="api_key" type="text" required autocomplete="off" />
+          </label>
+          <label>API Secret
+            <input name="api_secret" type="password" required autocomplete="off" />
+          </label>
+          <label>Passphrase (OKX, KuCoin)
+            <input name="passphrase" type="password" autocomplete="off" />
+          </label>
+        </div>
+        <button type="submit">Сохранить ключ</button>
+      </form>
+
+      <h3>Сохранённые ключи</h3>
+      <table id="keys-table">
+        <thead>
+          <tr><th>ID</th><th>Биржа</th><th>Метка</th><th>Demo</th>
+              <th>Ключ</th><th>Баланс USDT</th><th></th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>2. Проверка пары</h2>
+      <form id="ticker-form" class="inline-form">
+        <label>Ключ ID
+          <input name="key_id" type="number" required style="width:80px" />
+        </label>
+        <label>Символ
+          <input name="symbol" type="text" value="BTC/USDT" required />
+        </label>
+        <button type="submit">Узнать цену</button>
+      </form>
+      <pre id="ticker-result"></pre>
+    </section>
+
+    <section class="card">
+      <h2>3. Создать grid-бота</h2>
+      <form id="bot-form">
+        <div class="row">
+          <label>Ключ ID
+            <input name="api_key_id" type="number" required value="1" />
+          </label>
+          <label>Символ
+            <input name="symbol" type="text" value="BTC/USDT" required />
+          </label>
+          <label>&nbsp;</label>
+        </div>
+        <div class="row">
+          <label>Нижняя цена
+            <input name="lower_price" type="number" step="any" required placeholder="например 60000" />
+          </label>
+          <label>Верхняя цена
+            <input name="upper_price" type="number" step="any" required placeholder="например 70000" />
+          </label>
+          <label>Уровней
+            <input name="grid_levels" type="number" value="10" min="3" max="200" required />
+          </label>
+        </div>
+        <div class="row">
+          <label>Размер ордера, USDT
+            <input name="order_size_quote" type="number" step="0.01" value="20" required />
+          </label>
+          <label>Stop-Loss %
+            <input name="stop_loss_pct" type="number" step="0.1" placeholder="напр. 10 (опционально)" />
+          </label>
+          <label>&nbsp;</label>
+        </div>
+        <button type="submit">Создать бота</button>
+        <button type="button" class="ghost-action" onclick="autoFillRange()">⚡ Авто-подбор диапазона</button>
+        <span id="auto-range-info" class="hint"></span>
+      </form>
+
+      <h3>Мои боты <button class="ghost" type="button" onclick="loadBots()">↻</button></h3>
+      <table id="bots-table">
+        <thead>
+          <tr>
+            <th>ID</th><th>Биржа</th><th>Пара</th>
+            <th>Диапазон</th><th>Уровней</th><th>Размер</th>
+            <th>Статус</th><th>Открытых</th><th>Закрытых</th>
+            <th>P&amp;L</th><th>Действия</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div id="trades-pane"></div>
+    </section>
+
+    <section class="card">
+      <h2>4. Telegram-уведомления</h2>
+      <p class="hint">
+        Чтобы получать сообщения о сделках в Telegram:
+        1) создай бота через <a href="https://t.me/BotFather" target="_blank">@BotFather</a>,
+        получи токен.
+        2) Узнай свой chat_id (например через <a href="https://t.me/userinfobot" target="_blank">@userinfobot</a>).
+        3) Заполни в файле <code>.env</code> строки <code>TELEGRAM_BOT_TOKEN</code> и
+        <code>TELEGRAM_CHAT_ID</code>, перезапусти сервер.
+      </p>
+      <div>
+        <span id="tg-status" class="hint">…</span>
+        <button type="button" onclick="testTelegram()">Отправить тест</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>5. Бэктест на истории <span class="badge">проверка эффективности</span></h2>
+      <p class="hint">
+        Симуляция grid-стратегии на реальных свечах из биржи. Покажет: сколько бы
+        заработал с заданными параметрами за прошедший период. Учитывает комиссии.
+      </p>
+      <form id="backtest-form">
+        <div class="row">
+          <label>Ключ ID
+            <input name="key_id" type="number" required value="1" />
+          </label>
+          <label>Символ
+            <input name="symbol" type="text" value="BTC/USDT" required />
+          </label>
+          <label>Период, дней
+            <input name="days" type="number" value="30" min="1" max="365" required />
+          </label>
+        </div>
+        <div class="row">
+          <label>Нижняя цена
+            <input name="lower_price" type="number" step="any" required />
+          </label>
+          <label>Верхняя цена
+            <input name="upper_price" type="number" step="any" required />
+          </label>
+          <label>Уровней
+            <input name="grid_levels" type="number" value="12" min="3" max="100" required />
+          </label>
+        </div>
+        <div class="row">
+          <label>Размер ордера, USDT
+            <input name="order_size_quote" type="number" step="0.01" value="100" required />
+          </label>
+          <label>Комиссия (0.001 = 0.1%)
+            <input name="fee_rate" type="number" step="0.0001" value="0.001" required />
+          </label>
+          <label>Таймфрейм
+            <select name="timeframe">
+              <option value="5m">5m</option>
+              <option value="15m">15m</option>
+              <option value="1h" selected>1h</option>
+              <option value="4h">4h</option>
+            </select>
+          </label>
+        </div>
+        <button type="submit">Запустить бэктест</button>
+        <button type="button" class="ghost-action" onclick="copyParamsFromCreate()">↑ Скопировать из формы #3</button>
+      </form>
+      <div id="backtest-result"></div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

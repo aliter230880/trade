@@ -1,0 +1,9 @@
+trade.aliterra.space {
+	encode gzip
+	reverse_proxy 127.0.0.1:8000
+}
+
+# Также отвечаем по IP (для случаев если DNS не сработал)
+http://168.222.143.103 {
+	reverse_proxy 127.0.0.1:8000
+}

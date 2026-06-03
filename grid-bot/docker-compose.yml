@@ -1,0 +1,15 @@
+version: "3.9"
+
+services:
+  grid-bot:
+    build: .
+    image: grid-bot:latest
+    container_name: grid-bot
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./.env:/app/.env:ro
+    environment:
+      - TZ=Europe/Moscow
