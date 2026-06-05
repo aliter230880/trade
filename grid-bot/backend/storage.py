@@ -274,7 +274,7 @@ def set_bot_status(bot_id: int, status: str) -> None:
 def list_bot_orders(bot_id: int, limit: int = 50) -> list[dict]:
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT id, side, price, amount, status, created_at, filled_at, "
+            "SELECT id, exchange_order_id, side, price, amount, status, created_at, filled_at, "
             "fill_price, fill_qty, fee, fee_coin, realized_pnl, pair_buy_id, level_index "
             "FROM bot_orders WHERE bot_id=? ORDER BY id DESC LIMIT ?",
             (bot_id, limit),
@@ -286,7 +286,7 @@ def list_filled_trades(bot_id: int, limit: int = 100) -> list[dict]:
     """Только закрытые ордера — для истории сделок и P&L."""
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT id, side, price, amount, status, created_at, filled_at, "
+            "SELECT id, exchange_order_id, side, price, amount, status, created_at, filled_at, "
             "fill_price, fill_qty, fee, fee_coin, realized_pnl, pair_buy_id, level_index "
             "FROM bot_orders WHERE bot_id=? AND status='filled' "
             "ORDER BY filled_at DESC LIMIT ?",
