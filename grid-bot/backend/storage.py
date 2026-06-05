@@ -96,7 +96,6 @@ _MIGRATIONS = [
 def init_db(db_path: Path = settings.db_path) -> None:
     with sqlite3.connect(db_path) as conn:
         conn.executescript(SCHEMA)
-        # Применяем миграции, игнорируя ошибки "duplicate column"
         for stmt in _MIGRATIONS:
             try:
                 conn.execute(stmt)
@@ -263,6 +262,15 @@ def delete_grid_bot(bot_id: int) -> None:
         conn.execute("DELETE FROM grid_bots WHERE id=?", (bot_id,))
 
 
+def set_bot_status(bot_id: int, status: str) -> None:
+    """Устанавливает статус бота напрямую (используется при ошибках авто-запуска)."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE grid_bots SET status=? WHERE id=?",
+            (status, bot_id),
+        )
+
+
 def list_bot_orders(bot_id: int, limit: int = 50) -> list[dict]:
     with get_conn() as conn:
         rows = conn.execute(
@@ -288,11 +296,7 @@ def list_filled_trades(bot_id: int, limit: int = 100) -> list[dict]:
 
 
 def find_oldest_unmatched_buy(bot_id: int) -> Optional[dict]:
-    """Находит самый старый исполненный buy, для которого ещё нет парного sell.
-
-    Используется при FIFO-расчёте P&L: когда sell исполняется, мы
-    привязываем его к buy и фиксируем точную прибыль.
-    """
+    """Находит самый старый исполненный buy без парного sell (для FIFO P&L)."""
     with get_conn() as conn:
         r = conn.execute(
             """SELECT bo.id, bo.fill_price, bo.fill_qty, bo.fee
@@ -345,7 +349,7 @@ def update_order_fill_v2(
     fee_coin: str = "",
     realized_pnl: float = 0,
 ) -> None:
-    """Версия для level-to-level matching: без pair_buy_id (не используется)."""
+    """Версия для level-to-level matching: без pair_buy_id."""
     with get_conn() as conn:
         conn.execute(
             """UPDATE bot_orders

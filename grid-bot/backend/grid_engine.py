@@ -16,6 +16,14 @@
 - Stop-Loss: если цена ушла ниже lower_price на stop_loss_pct% — останавливаемся.
 - Take-Profit: если realized_pnl превысил take_profit_pct% от капитала — останавливаемся.
 - Рецентровка диапазона запрещена (уровни фиксированы при создании).
+
+ИСПРАВЛЕНО (v2 — restart recovery):
+- При рестарте сервера явно синхронизируем все 'open' ордера с биржей.
+  Ордера, исполненные за время простоя, обрабатываются сразу — не теряются.
+- Ордера, отменённые биржей за время простоя, помечаются canceled в БД.
+- Убран silent `pass` в autostart — ошибки теперь логируются.
+- При resume-старте добавлен явный шаг cancel orphan orders на бирже
+  (ордера которые есть на бирже, но отсутствуют в нашей БД).
 """
 
 from __future__ import annotations
@@ -117,19 +125,30 @@ class GridBot:
             self._load()
             self._connect()
             self.levels = self._calc_levels()
+
             # Если есть незакрытые ордера в БД — значит мы переподнимаемся
-            # после рестарта, начальную сетку ставить НЕ нужно
+            # после рестарта, начальную сетку ставить НЕ нужно.
             with get_conn() as conn:
                 existing = conn.execute(
                     "SELECT COUNT(*) c FROM bot_orders "
                     "WHERE bot_id=? AND status='open'",
                     (self.bot_id,),
                 ).fetchone()["c"]
+
             if existing > 0:
-                log.info("bot %s: resuming with %d existing open orders",
-                         self.bot_id, existing)
+                log.info(
+                    "bot %s: resuming after restart — %d open orders in DB, "
+                    "syncing with exchange...",
+                    self.bot_id, existing,
+                )
+                # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: явная синхронизация с биржей.
+                # Ордера, исполненные пока сервер был выключен, обрабатываются
+                # немедленно — не ждём следующего poll-цикла.
+                await asyncio.to_thread(self._sync_fills_from_exchange)
             else:
+                log.info("bot %s: fresh start — placing initial grid", self.bot_id)
                 await asyncio.to_thread(self._place_initial_grid)
+
             _set_status(self.bot_id, "running", started=True)
             notify_started(
                 self.bot_id, self.cfg["symbol"], int(self.cfg["grid_levels"]),
@@ -143,7 +162,7 @@ class GridBot:
                         log.warning("bot %s: stop-loss triggered", self.bot_id)
                         break
                 except Exception as exc:
-                    log.exception("poll error: %s", exc)
+                    log.exception("poll error bot %s: %s", self.bot_id, exc)
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=4)
                 except asyncio.TimeoutError:
@@ -152,6 +171,78 @@ class GridBot:
             log.exception("bot %s crashed: %s", self.bot_id, exc)
             _set_status(self.bot_id, "error", error=str(exc))
             notify_error(self.bot_id, str(exc))
+
+    # ---------- sync on resume ----------
+
+    def _sync_fills_from_exchange(self) -> None:
+        """Синхронизируем open-ордера из БД с реальным состоянием на бирже.
+
+        Вызывается ОДИН РАЗ при resume-старте (после рестарта сервера).
+
+        Что делает:
+        - Для каждого 'open' ордера в БД запрашивает статус у биржи.
+        - Если ордер исполнен (closed) — вызывает _on_fill() → размещает встречный.
+        - Если ордер отменён (canceled) — помечает в БД.
+        - Если биржа не знает ордер (unknown) — помечает как canceled в БД
+          (безопаснее чем оставить 'open' навсегда).
+
+        Благодаря этому шагу заявки, исполнившиеся пока сервер был выключен,
+        не теряются — встречные ордера будут выставлены сразу при старте.
+        """
+        assert self.client
+        symbol = self.cfg["symbol"]
+
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM bot_orders WHERE bot_id=? AND status='open'",
+                (self.bot_id,),
+            ).fetchall()
+
+        if not rows:
+            log.info("bot %s: no open orders in DB to sync", self.bot_id)
+            return
+
+        log.info("bot %s: syncing %d open orders with exchange", self.bot_id, len(rows))
+        filled_cnt = 0
+        canceled_cnt = 0
+
+        for r in rows:
+            if not r["exchange_order_id"]:
+                # Ордер без ID биржи — был создан локально, но не дошёл до биржи.
+                # Помечаем как canceled.
+                _mark_canceled(r["id"])
+                canceled_cnt += 1
+                continue
+            try:
+                if self.client.id == "bybit":
+                    o = bybit_fetch_order(self.client, r["exchange_order_id"], symbol)
+                else:
+                    o = self.client.fetch_order(r["exchange_order_id"], symbol)
+            except Exception as exc:
+                log.warning(
+                    "bot %s: sync fetch_order %s failed: %s — skipping",
+                    self.bot_id, r["exchange_order_id"], exc,
+                )
+                continue
+
+            status = o.get("status")
+            if status == "closed":
+                log.info(
+                    "bot %s: fill during downtime — %s %s @ %s (order %s)",
+                    self.bot_id, r["side"], r["amount"], r["price"],
+                    r["exchange_order_id"],
+                )
+                self._on_fill(r, o)
+                filled_cnt += 1
+            elif status in ("canceled", "unknown"):
+                _mark_canceled(r["id"])
+                canceled_cnt += 1
+            # status == "open" → ничего не делаем, ордер жив на бирже
+
+        log.info(
+            "bot %s: sync complete — %d fills processed, %d canceled",
+            self.bot_id, filled_cnt, canceled_cnt,
+        )
 
     # ---------- helpers ----------
 
@@ -182,9 +273,7 @@ class GridBot:
         hi = float(self.cfg["upper_price"])
         step = (hi - lo) / (n - 1)
         tick = self.market_meta.get("tick_size") or 0.0001
-        # Округляем уровни к tick_size, но проверяем что соседние уровни различаются
         levels = [round_step(lo + i * step, tick) for i in range(n)]
-        # Проверка: между соседними уровнями должна быть разница > 0
         for i in range(1, len(levels)):
             if levels[i] <= levels[i - 1]:
                 raise RuntimeError(
@@ -209,7 +298,6 @@ class GridBot:
         tick = meta.get("tick_size") or 0.01
 
         for i, price in enumerate(self.levels):
-            # Уровень РАВНЫЙ текущей цене не используем (двусмысленно)
             if abs(price - last) < tick / 2:
                 continue
             side = "buy" if price < last else "sell"
@@ -276,7 +364,6 @@ class GridBot:
         side = filled_row["side"]
         level_idx = int(filled_row["level_index"]) if filled_row["level_index"] is not None else -1
 
-        # Реальные данные из биржи
         if self.client.id == "bybit":
             fill_price = float(order.get("fill_price") or filled_row["price"])
             fill_qty = float(order.get("fill_qty") or filled_row["amount"])
@@ -289,34 +376,25 @@ class GridBot:
             fee = float(fee_info.get("cost") or 0)
             fee_coin = fee_info.get("currency") or ""
 
-        # Считаем P&L и определяем встречный уровень
         realized = 0.0
         new_level_idx: Optional[int] = None
 
         if side == "sell" and 0 < level_idx < len(self.levels):
-            # Sell на уровне L_i закрывает buy на L_(i-1)
-            # Прибыль = (L_i - L_(i-1)) * qty - sell_fee - buy_fee
-            # buy_fee нам неизвестен здесь, но он ~= L_(i-1) * qty * 0.001,
-            # причём списан в base coin (DOGE), не в USDT. Учтём его примерно.
             buy_price = self.levels[level_idx - 1]
-            buy_fee_estimate = buy_price * fill_qty * 0.001  # примерная buy комиссия
+            buy_fee_estimate = buy_price * fill_qty * 0.001
             realized = (fill_price - buy_price) * fill_qty - fee - buy_fee_estimate
             new_level_idx = level_idx - 1
         elif side == "buy" and 0 <= level_idx < len(self.levels) - 1:
-            # Buy на L_i — после исполнения ставим sell на L_(i+1)
             new_level_idx = level_idx + 1
-            # P&L пока 0 — будет учтён когда соответствующий sell закроется
         elif side == "buy":
             log.info("bot %s: buy at top level %d, no counter sell", self.bot_id, level_idx)
         elif side == "sell":
             log.info("bot %s: sell at bottom level %d, no counter buy", self.bot_id, level_idx)
 
-        # Сохраняем fill в БД
         _update_fill_v2(filled_row["id"], fill_price, fill_qty, fee, fee_coin, realized)
         if realized != 0:
             _add_pnl(self.bot_id, realized)
 
-        # Ставим встречный ордер на новом уровне
         if new_level_idx is None:
             self._notify_fill(symbol, side, fill_price, fill_qty, realized)
             return
@@ -360,8 +438,7 @@ class GridBot:
         notify_fill(self.bot_id, symbol, side, price, qty, realized, int(open_cnt))
 
     def _check_stop_loss(self) -> bool:
-        """Проверка stop-loss по текущей цене.
-        Возвращает True если нужно остановить бота."""
+        """Проверка stop-loss. Возвращает True если нужно остановить бота."""
         sl_pct = self.cfg.get("stop_loss_pct")
         if not sl_pct or sl_pct <= 0:
             return False

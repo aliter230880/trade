@@ -1,5 +1,7 @@
 """FastAPI-приложение grid-бота."""
 
+import asyncio
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -21,6 +23,7 @@ from .models import (
     TickerOut,
 )
 
+log = logging.getLogger("main")
 
 app = FastAPI(title="Grid Trading Bot", version="0.1.0")
 
@@ -42,16 +45,37 @@ async def autostart_running_bots() -> None:
     """Если в БД остались боты со статусом 'running' — перезапустим их.
 
     Полезно если сервер перезапустился (рестарт VPS, обновление, краш).
+
+    ИСПРАВЛЕНО v2:
+    - Ошибки теперь логируются (раньше `except: pass` их глотал).
+    - Бот сам делает _sync_fills_from_exchange() при resume-старте,
+      поэтому ордера, исполненные за время простоя, не теряются.
     """
-    import asyncio as _asyncio
     bots = storage.list_grid_bots()
-    for b in bots:
-        if b["status"] == "running":
-            try:
-                bot = get_bot(b["id"])
-                _asyncio.create_task(bot.start())
-            except Exception:
-                pass
+    running = [b for b in bots if b["status"] == "running"]
+
+    if not running:
+        log.info("autostart: no running bots to resume")
+        return
+
+    log.info("autostart: found %d bot(s) to resume after restart", len(running))
+
+    for b in running:
+        try:
+            bot = get_bot(b["id"])
+            asyncio.create_task(bot.start())
+            log.info(
+                "autostart: scheduled resume for bot %d (%s %s)",
+                b["id"], b["exchange"], b["symbol"],
+            )
+        except Exception as exc:
+            # Раньше здесь был `pass` — ошибка при рестарте оставалась невидимой.
+            log.error(
+                "autostart: failed to resume bot %d (%s %s): %s",
+                b["id"], b["exchange"], b["symbol"], exc,
+            )
+            # Помечаем как error чтобы пользователь видел проблему в UI
+            storage.set_bot_status(b["id"], "error")
 
 
 # -------- API: ключи --------
@@ -230,11 +254,7 @@ def auto_range(key_id: int, symbol: str, days: int = 7, mult: float = 1.5,
 
 @app.post("/api/backtest")
 def backtest(payload: dict) -> dict:
-    """Бэктест grid-стратегии на исторических свечах.
-
-    body: {key_id, symbol, lower_price, upper_price, grid_levels,
-           order_size_quote, days, timeframe, fee_rate}
-    """
+    """Бэктест grid-стратегии на исторических свечах."""
     rec = storage.get_api_key(payload["key_id"])
     if not rec:
         raise HTTPException(404, "Ключ не найден")
